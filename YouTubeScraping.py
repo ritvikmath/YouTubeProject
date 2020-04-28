@@ -15,6 +15,8 @@ import sys
 import os
 import pickle
 import google.oauth2.credentials
+from email.mime.text import MIMEText
+import base64
 
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
@@ -104,6 +106,58 @@ def get_authenticated_service():
             pickle.dump(credentials, token)
 
     return build(API_SERVICE_NAME, API_VERSION, credentials = credentials)
+
+def get_authenticated_gmail_service():
+    credentials = None
+    API_SERVICE_NAME = 'gmail'
+    API_VERSION = 'v1'
+    
+    if os.path.exists('token_gmail.pickle'):
+        with open('token_gmail.pickle', 'rb') as token:
+            credentials = pickle.load(token)
+
+    return build(API_SERVICE_NAME, API_VERSION, credentials = credentials)
+
+# # GMAIL FUNCTIONS
+    
+def create_message(sender, to, subject, message_text):
+    """Create a message for an email.
+
+    Args:
+    sender: Email address of the sender.
+    to: Email address of the receiver.
+    subject: The subject of the email message.
+    message_text: The text of the email message.
+
+    Returns:
+    An object containing a base64url encoded email object.
+    """
+    message = MIMEText(message_text)
+    message['to'] = to
+    message['from'] = sender
+    message['subject'] = subject
+    return {'raw': base64.urlsafe_b64encode(message.as_string().encode()).decode()}
+
+def send_message(service, user_id, message):
+    """Send an email message.
+
+    Args:
+    service: Authorized Gmail API service instance.
+    user_id: User's email address. The special value "me"
+    can be used to indicate the authenticated user.
+    message: Message to be sent.
+
+    Returns:
+    Sent Message.
+    """
+    
+    try:
+        message = (service.users().messages().send(userId=user_id, body=message)
+                   .execute())
+        print('Message Id: %s' % message['id'])
+        return message
+    except Exception as e:
+        print('An error occurred: %s' % e)
 
 
 # # Core Functions
@@ -201,13 +255,19 @@ def get_channels_to_analyze(service, cur, conn):
         channel_info[channel_ids[i]] = {'upload_id': upload_ids[i], 'last_num_vids': num_vids[i]}
     
     #get statistics on each channel
-    results = service.channels().list(part='statistics', id=','.join(channel_ids)).execute()
+    batch_size = 50
+    results = []
+    num_batches = int(len(channel_ids) / batch_size) + 1
+    for i in range(num_batches):
+        curr_channel_ids = channel_ids[batch_size*i : batch_size*(i+1)]
+        curr_results = service.channels().list(part='statistics', id=','.join(curr_channel_ids)).execute()
+        results.extend(curr_results['items'])
     
     #this will be the final list to return
     uploads_to_analyze = []
     
     #for each resulting channel stats...
-    for result in results['items']:
+    for result in results:
         #get channel id and current number of videos
         channel_id = try_get_metric(result, ['id'])
         num_videos = int(try_get_metric(result, ['statistics', 'videoCount']))
@@ -224,6 +284,10 @@ def get_channels_to_analyze(service, cur, conn):
             #update the table with latest number of videos recorded
             cur.execute('UPDATE Channels SET NumVideos = %s WHERE ChannelId = "%s"'%(num_videos, channel_id))
             conn.commit()
+    
+    #if this is a four hour timepoint, do a full data collection for safety
+    if datetime.now().hour % 4 == 2:
+        return upload_ids, []
     
     #return the uploads we need to reanalyze and all the others
     return uploads_to_analyze, [upload for upload in upload_ids if upload not in uploads_to_analyze]
@@ -350,7 +414,7 @@ def insert_into_videos(cur, recent_videos):
     video_ids_to_insert = [vid_id for vid_id in video_ids if vid_id not in existing_video_ids]
     
     #gather a list of rows to insert
-    rows_to_insert = [(data['upload_id'], vid_id, data['title'], data['description'],                        data['thumbnail_url'], data['published_date'], None, None)                       for vid_id, data in recent_videos.items() if vid_id in video_ids_to_insert]
+    rows_to_insert = [(data['upload_id'], vid_id, data['title'], data['description'], data['thumbnail_url'], data['published_date'], None, None) for vid_id, data in recent_videos.items() if vid_id in video_ids_to_insert]
     
     #enter these rows into the table
     cur.executemany('INSERT INTO Videos VALUES (?,?,?,?,?,?,?,?)', rows_to_insert)
@@ -436,68 +500,102 @@ def delete_all_data(full=False):
 
 if __name__ == '__main__':
     
-    try:
+    max_retries = 3
+    curr_attempt = 0
+    operation_success = False
+    
+    #while we have not succeeded and haven't exceeded max retries
+    while (not operation_success) and (curr_attempt < max_retries):
         
-        status_logs = open("youtube_status_logging.txt", "a+")
-        error_logs = open("youtube_error_logging.txt", "a+")
+        curr_attempt += 1
+    
+        try:
+            
+            status_logs = open("youtube_status_logging.txt", "a+")
+            error_logs = open("youtube_error_logging.txt", "a+")
+                
+            status_logs.write(str(datetime.now()) + '\n\n')
+            
+            if datetime.now().hour % 4 == 2:
+                status_logs.write('Full Data Collection\n\n')
+            
+            #API setup
+            CLIENT_SECRETS_FILE = "client_secret.json"
+            SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
+            API_SERVICE_NAME = 'youtube'
+            API_VERSION = 'v3'
+    
+            os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
+            service = get_authenticated_service()
+            
+            gmail_service = get_authenticated_gmail_service()
+    
+            #create a database connection
+            conn = sqlite3.connect('videos.db')
+    
+            #create a cursor
+            cur = conn.cursor()
+    
+            #populate data for new channels
+            channels_updated = populate_channel_data(service, cur, conn)
+            updated_channels_message = 'Updated Channels: %s'
+            print(updated_channels_message%len(channels_updated))
+            status_logs.write(updated_channels_message%channels_updated + '\n\n')
+            
+    
+            #get channels that need analysis
+            uploads_to_analyze, other_uploads = get_channels_to_analyze(service, cur, conn)
+    
+            #get recent videos
+            recent_vids = get_most_recent_videos(service, uploads_to_analyze, 25)
+    
+            #insert those videos into the table    
+            videos_added = insert_into_videos(cur, recent_vids)
+    
+            #get ids of videos for channels not just analyzed
+            old_video_ids = get_old_video_ids(cur, other_uploads)
+    
+            #get stats for recent videos
+            all_vids = list(recent_vids.keys()) + old_video_ids
+    
+            video_stats = get_most_recent_video_stats(service, all_vids)
+            stats_rows_inserted, videos_updated = insert_into_video_statistics(cur, video_stats)
+            videos_added_message = "Videos Added: %s"
+            stats_inserted_message = "Stats Inserted: %s"%stats_rows_inserted
+            
+            print(videos_added_message%len(videos_added))
+            print(stats_inserted_message)
+            
+            status_logs.write(videos_added_message%videos_added + '\n\n')
+            status_logs.write(stats_inserted_message + '\n\n')
+            status_logs.write('-------------\n\n')
+            
+            my_email = 'ritvikmathematics@gmail.com'
+            subject = 'Logged Data on %s'%str(datetime.now())
+            body = updated_channels_message%channels_updated + '\n\n' + videos_added_message%videos_added + '\n\n' + stats_inserted_message + '\n\n'
+            
+            if datetime.now().hour % 4 == 2:
+                body = 'Full Data Collection\n\n' + body
+                
+            success_email = create_message(my_email, my_email, subject, body)
+            send_message(gmail_service, 'me', success_email)
+            
+            conn.commit()
+            
+            operation_success = True
+            
+        except Exception as e:
+            error_logs.write(str(datetime.now()) + '\n\n' + str(e) + '\n\nAttempt: ' + str(curr_attempt) + '\n-----------------\n\n')
+            my_email = 'ritvikmathematics@gmail.com'
+            subject = 'Data Collection Error on %s : Attempt %s'%(str(datetime.now()), curr_attempt)
+            error_email = create_message(my_email, my_email, subject, str(e))
+            send_message(gmail_service, 'me', error_email)
+            
+        finally:
+            conn.close()
+            status_logs.close()
+            error_logs.close()
         
-        status_logs.write(str(datetime.now()) + '\n\n')
-        
-        #API setup
-        CLIENT_SECRETS_FILE = "client_secret.json"
-        SCOPES = ['https://www.googleapis.com/auth/youtube.force-ssl']
-        API_SERVICE_NAME = 'youtube'
-        API_VERSION = 'v3'
-
-        os.environ['OAUTHLIB_INSECURE_TRANSPORT'] = '1'
-        service = get_authenticated_service()
-
-        #create a database connection
-        conn = sqlite3.connect('videos.db')
-
-        #create a cursor
-        cur = conn.cursor()
-
-        #populate data for new channels
-        channels_updated = populate_channel_data(service, cur, conn)
-        updated_channels_message = 'Updated Channels: %s'
-        print(updated_channels_message%len(channels_updated))
-        status_logs.write(updated_channels_message%channels_updated + '\n\n')
-        
-
-        #get channels that need analysis
-        uploads_to_analyze, other_uploads = get_channels_to_analyze(service, cur, conn)
-
-        #get recent videos
-        recent_vids = get_most_recent_videos(service, uploads_to_analyze, 25)
-
-        #insert those videos into the table    
-        videos_added = insert_into_videos(cur, recent_vids)
-
-        #get ids of videos for channels not just analyzed
-        old_video_ids = get_old_video_ids(cur, other_uploads)
-
-        #get stats for recent videos
-        all_vids = list(recent_vids.keys()) + old_video_ids
-
-        video_stats = get_most_recent_video_stats(service, all_vids)
-        stats_rows_inserted, videos_updated = insert_into_video_statistics(cur, video_stats)
-        videos_added_message = "Videos Added: %s"
-        stats_inserted_message = "Stats Inserted: %s"%stats_rows_inserted
-        
-        print(videos_added_message%len(videos_added))
-        print(stats_inserted_message)
-        
-        status_logs.write(videos_added_message%videos_added + '\n\n')
-        status_logs.write(stats_inserted_message + '\n\n')
-        status_logs.write('-------------\n\n')
-        
-        conn.commit()
-        
-    except Exception as e:
-        error_logs.write(str(datetime.now()) + '\n\n' + str(e) + '\n-----------------\n\n')
-        
-    finally:
-        conn.close()
-        status_logs.close()
-        error_logs.close()
+        #if the operation did not succeed, sleep for a minute before retrying
+        if operation_success == False:
+            sleep(60)
